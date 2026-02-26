@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# Type checkers
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# DVC
+/tmp
+.dvc/cache
+.dvc/tmp
+*.dvc
+
+# Data files (tracked by DVC, not git)
+data/
+*.parquet
+*.csv
+*.arrow
+
+# Alembic
+alembic.ini
+
+# OS
+.DS_Store
+Thumbs.db
