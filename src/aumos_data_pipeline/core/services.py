@@ -23,9 +23,15 @@ from aumos_common.observability import get_logger
 
 from aumos_data_pipeline.core.interfaces import (
     CleanerProtocol,
+    DataLineageTrackerProtocol,
+    DataQualityMonitorProtocol,
+    DeidentifierProtocol,
+    IncrementalLoaderProtocol,
     IngestorProtocol,
     ProfilerProtocol,
     QualityGateProtocol,
+    SchedulingAdapterProtocol,
+    SamplingEngineProtocol,
     TransformerProtocol,
     VersionerProtocol,
 )
@@ -796,3 +802,692 @@ class VersioningService:
         if not version_data:
             raise NotFoundError(f"Data version '{version_hash}' not found")
         return version_data
+
+
+class DeidentificationService:
+    """Orchestrates PII de-identification for datasets in the pipeline.
+
+    Wraps a DeidentifierProtocol adapter and wires job lifecycle events
+    so that de-identification runs are tracked alongside other pipeline stages.
+    """
+
+    def __init__(
+        self,
+        deidentifier: DeidentifierProtocol,
+        job_repository: Any,
+        storage: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialize the de-identification service.
+
+        Args:
+            deidentifier: PII masking adapter implementation.
+            job_repository: Repository for PipelineJob persistence.
+            storage: Storage adapter for reading/writing datasets.
+            event_publisher: Kafka publisher for pipeline lifecycle events.
+        """
+        self._deidentifier = deidentifier
+        self._job_repo = job_repository
+        self._storage = storage
+        self._publisher = event_publisher
+
+    async def deidentify(
+        self,
+        tenant_id: uuid.UUID,
+        input_uri: str,
+        deidentification_config: dict[str, Any],
+        destination_config: dict[str, Any],
+    ) -> PipelineJob:
+        """De-identify a dataset and write the masked result to storage.
+
+        Args:
+            tenant_id: Tenant context.
+            input_uri: MinIO/S3 URI of the dataset to de-identify.
+            deidentification_config: PII masking parameters per column.
+            destination_config: Output configuration for the masked dataset.
+
+        Returns:
+            PipelineJob with status COMPLETED and output_uri set.
+        """
+        job = await self._job_repo.create(
+            PipelineJob(
+                tenant_id=tenant_id,
+                job_type=JobType.TRANSFORM,
+                status=JobStatus.PENDING,
+                source_config={"input_uri": input_uri, "deidentification_config": deidentification_config},
+                destination_config=destination_config,
+            )
+        )
+
+        logger.info(
+            "De-identification started",
+            job_id=str(job.id),
+            input_uri=input_uri,
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+            dataframe = await self._storage.read_parquet(input_uri, tenant_id=tenant_id)
+
+            result = await self._deidentifier.deidentify(
+                dataframe=dataframe,
+                deidentification_config=deidentification_config,
+                job_id=job.id,
+                tenant_id=tenant_id,
+            )
+
+            masked_df = result["dataframe"]
+            output_uri = await self._storage.write_parquet(
+                dataframe=masked_df,
+                destination_config=destination_config,
+                tenant_id=tenant_id,
+                job_id=job.id,
+            )
+
+            job = await self._job_repo.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                row_count=len(masked_df),
+                column_count=len(masked_df.columns),
+                output_uri=output_uri,
+            )
+
+            await self._publisher.publish(
+                Topics.PIPELINE_JOB_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "job_id": str(job.id),
+                    "pii_columns_detected": result["pii_columns_detected"],
+                    "risk_score": result["risk_score"],
+                    "output_uri": output_uri,
+                },
+            )
+
+            logger.info(
+                "De-identification completed",
+                job_id=str(job.id),
+                pii_columns=len(result["pii_columns_detected"]),
+                risk_score=result["risk_score"],
+            )
+            return job
+
+        except Exception as exc:
+            logger.error("De-identification failed", job_id=str(job.id), error=str(exc))
+            await self._job_repo.update(job.id, status=JobStatus.FAILED, error_message=str(exc))
+            await self._publisher.publish(
+                Topics.PIPELINE_JOB_FAILED,
+                {"tenant_id": str(tenant_id), "job_id": str(job.id), "error": str(exc)},
+            )
+            raise
+
+
+class SamplingService:
+    """Applies data sampling strategies to datasets in the pipeline.
+
+    Wraps a SamplingEngineProtocol adapter to allow statistical sub-sampling
+    before expensive training or synthesis operations.
+    """
+
+    def __init__(
+        self,
+        sampling_engine: SamplingEngineProtocol,
+        job_repository: Any,
+        storage: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialize the sampling service.
+
+        Args:
+            sampling_engine: Sampling algorithm implementation.
+            job_repository: Repository for PipelineJob persistence.
+            storage: Storage adapter for reading/writing datasets.
+            event_publisher: Kafka publisher for pipeline lifecycle events.
+        """
+        self._engine = sampling_engine
+        self._job_repo = job_repository
+        self._storage = storage
+        self._publisher = event_publisher
+
+    async def sample(
+        self,
+        tenant_id: uuid.UUID,
+        input_uri: str,
+        sampling_config: dict[str, Any],
+        destination_config: dict[str, Any],
+    ) -> PipelineJob:
+        """Sample a dataset according to the configured strategy.
+
+        Args:
+            tenant_id: Tenant context.
+            input_uri: MinIO/S3 URI of the dataset to sample.
+            sampling_config: Sampling parameters (strategy, sample_size, seed, etc.)
+            destination_config: Output configuration.
+
+        Returns:
+            PipelineJob with status COMPLETED and output_uri set.
+        """
+        job = await self._job_repo.create(
+            PipelineJob(
+                tenant_id=tenant_id,
+                job_type=JobType.TRANSFORM,
+                status=JobStatus.PENDING,
+                source_config={"input_uri": input_uri, "sampling_config": sampling_config},
+                destination_config=destination_config,
+            )
+        )
+
+        logger.info(
+            "Sampling started",
+            job_id=str(job.id),
+            input_uri=input_uri,
+            strategy=sampling_config.get("strategy", "random"),
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+            dataframe = await self._storage.read_parquet(input_uri, tenant_id=tenant_id)
+
+            result = await self._engine.sample(
+                dataframe=dataframe,
+                sampling_config=sampling_config,
+                job_id=job.id,
+                tenant_id=tenant_id,
+            )
+
+            sampled_df = result["dataframe"]
+            output_uri = await self._storage.write_parquet(
+                dataframe=sampled_df,
+                destination_config=destination_config,
+                tenant_id=tenant_id,
+                job_id=job.id,
+            )
+
+            job = await self._job_repo.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                row_count=result["sampled_rows"],
+                column_count=len(sampled_df.columns),
+                output_uri=output_uri,
+            )
+
+            await self._publisher.publish(
+                Topics.PIPELINE_JOB_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "job_id": str(job.id),
+                    "strategy": result["strategy"],
+                    "original_rows": result["original_rows"],
+                    "sampled_rows": result["sampled_rows"],
+                    "sampling_ratio": result["sampling_ratio"],
+                    "output_uri": output_uri,
+                },
+            )
+
+            logger.info(
+                "Sampling completed",
+                job_id=str(job.id),
+                original_rows=result["original_rows"],
+                sampled_rows=result["sampled_rows"],
+            )
+            return job
+
+        except Exception as exc:
+            logger.error("Sampling failed", job_id=str(job.id), error=str(exc))
+            await self._job_repo.update(job.id, status=JobStatus.FAILED, error_message=str(exc))
+            raise
+
+
+class IncrementalLoadService:
+    """Manages incremental (delta) data loading for efficient re-ingestion.
+
+    Wraps IncrementalLoaderProtocol to provide CDC-based upsert processing
+    with watermark tracking and batch management.
+    """
+
+    def __init__(
+        self,
+        incremental_loader: IncrementalLoaderProtocol,
+        job_repository: Any,
+        storage: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialize the incremental load service.
+
+        Args:
+            incremental_loader: CDC adapter implementation.
+            job_repository: Repository for PipelineJob persistence.
+            storage: Storage adapter for reading/writing datasets.
+            event_publisher: Kafka publisher for pipeline lifecycle events.
+        """
+        self._loader = incremental_loader
+        self._job_repo = job_repository
+        self._storage = storage
+        self._publisher = event_publisher
+
+    async def load_delta(
+        self,
+        tenant_id: uuid.UUID,
+        source_uri: str,
+        staging_uri: str | None,
+        load_config: dict[str, Any],
+        destination_config: dict[str, Any],
+    ) -> PipelineJob:
+        """Run an incremental load from a source dataset into staging.
+
+        Args:
+            tenant_id: Tenant context.
+            source_uri: URI of the full or recent source extract.
+            staging_uri: URI of the current staging dataset (None for first load).
+            load_config: CDC configuration (watermark_column, primary_key, etc.)
+            destination_config: Output configuration for the updated staging dataset.
+
+        Returns:
+            PipelineJob with status COMPLETED and output_uri set.
+        """
+        job = await self._job_repo.create(
+            PipelineJob(
+                tenant_id=tenant_id,
+                job_type=JobType.INGEST,
+                status=JobStatus.PENDING,
+                source_config={"source_uri": source_uri, "staging_uri": staging_uri, "load_config": load_config},
+                destination_config=destination_config,
+            )
+        )
+
+        logger.info(
+            "Incremental load started",
+            job_id=str(job.id),
+            source_uri=source_uri,
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+
+            source_df = await self._storage.read_parquet(source_uri, tenant_id=tenant_id)
+            existing_df: pd.DataFrame | None = None
+            if staging_uri:
+                existing_df = await self._storage.read_parquet(staging_uri, tenant_id=tenant_id)
+
+            result = await self._loader.load_delta(
+                source_df=source_df,
+                existing_df=existing_df,
+                load_config=load_config,
+                job_id=job.id,
+                tenant_id=tenant_id,
+            )
+
+            updated_df = result["dataframe"]
+            output_uri = await self._storage.write_parquet(
+                dataframe=updated_df,
+                destination_config=destination_config,
+                tenant_id=tenant_id,
+                job_id=job.id,
+            )
+
+            job = await self._job_repo.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                row_count=len(updated_df),
+                column_count=len(updated_df.columns),
+                output_uri=output_uri,
+            )
+
+            await self._publisher.publish(
+                Topics.PIPELINE_JOB_COMPLETED,
+                {
+                    "tenant_id": str(tenant_id),
+                    "job_id": str(job.id),
+                    "inserted_rows": result["inserted_rows"],
+                    "updated_rows": result["updated_rows"],
+                    "deleted_rows": result["deleted_rows"],
+                    "new_watermark": result["new_watermark"],
+                    "output_uri": output_uri,
+                },
+            )
+
+            logger.info(
+                "Incremental load completed",
+                job_id=str(job.id),
+                inserted=result["inserted_rows"],
+                updated=result["updated_rows"],
+                deleted=result["deleted_rows"],
+            )
+            return job
+
+        except Exception as exc:
+            logger.error("Incremental load failed", job_id=str(job.id), error=str(exc))
+            await self._job_repo.update(job.id, status=JobStatus.FAILED, error_message=str(exc))
+            raise
+
+
+class QualityMonitoringService:
+    """Evaluates data quality SLOs and aggregates dashboard metrics.
+
+    Wraps DataQualityMonitorProtocol to provide rule evaluation, SLO
+    monitoring, anomaly detection, and quality trend aggregation.
+    """
+
+    def __init__(
+        self,
+        quality_monitor: DataQualityMonitorProtocol,
+        job_repository: Any,
+        storage: Any,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialize the quality monitoring service.
+
+        Args:
+            quality_monitor: Quality SLO monitoring adapter.
+            job_repository: Repository for PipelineJob persistence.
+            storage: Storage adapter for reading datasets.
+            event_publisher: Kafka publisher for pipeline lifecycle events.
+        """
+        self._monitor = quality_monitor
+        self._job_repo = job_repository
+        self._storage = storage
+        self._publisher = event_publisher
+
+    async def run_quality_check(
+        self,
+        tenant_id: uuid.UUID,
+        input_uri: str,
+        rules: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Load a dataset and evaluate quality rules against it.
+
+        Args:
+            tenant_id: Tenant context.
+            input_uri: MinIO/S3 URI of the dataset to evaluate.
+            rules: Quality rule definitions.
+
+        Returns:
+            Quality evaluation results dict from the monitor adapter.
+        """
+        job = await self._job_repo.create(
+            PipelineJob(
+                tenant_id=tenant_id,
+                job_type=JobType.PROFILE,
+                status=JobStatus.PENDING,
+                source_config={"input_uri": input_uri, "rule_count": len(rules)},
+                destination_config={},
+            )
+        )
+
+        logger.info(
+            "Quality monitoring check started",
+            job_id=str(job.id),
+            input_uri=input_uri,
+            rule_count=len(rules),
+            tenant_id=str(tenant_id),
+        )
+
+        try:
+            job = await self._job_repo.update_status(job.id, JobStatus.RUNNING)
+            dataframe = await self._storage.read_parquet(input_uri, tenant_id=tenant_id)
+
+            evaluation_result = await self._monitor.evaluate_rules(
+                dataframe=dataframe,
+                rules=rules,
+                job_id=job.id,
+                tenant_id=tenant_id,
+            )
+
+            status = JobStatus.COMPLETED if evaluation_result["passed"] else JobStatus.FAILED
+            job = await self._job_repo.update(
+                job.id,
+                status=status,
+                quality_score=evaluation_result["quality_score"],
+            )
+
+            logger.info(
+                "Quality monitoring check completed",
+                job_id=str(job.id),
+                passed=evaluation_result["passed"],
+                quality_score=evaluation_result["quality_score"],
+                violations=len(evaluation_result["violations"]),
+            )
+            return evaluation_result
+
+        except Exception as exc:
+            logger.error("Quality monitoring check failed", job_id=str(job.id), error=str(exc))
+            await self._job_repo.update(job.id, status=JobStatus.FAILED, error_message=str(exc))
+            raise
+
+    async def get_dashboard(
+        self,
+        tenant_id: uuid.UUID,
+        lookback_entries: int = 30,
+    ) -> dict[str, Any]:
+        """Retrieve aggregated quality metric trends for a tenant.
+
+        Args:
+            tenant_id: Tenant context.
+            lookback_entries: Number of historical entries per metric.
+
+        Returns:
+            Dashboard data dict with trend analysis per metric.
+        """
+        return await self._monitor.aggregate_dashboard_data(
+            tenant_id=tenant_id,
+            lookback_entries=lookback_entries,
+        )
+
+
+class LineageService:
+    """Records and queries data lineage for pipeline transformations.
+
+    Wraps DataLineageTrackerProtocol to provide lineage recording on each
+    pipeline stage completion, field tracing, and impact analysis.
+    """
+
+    def __init__(
+        self,
+        lineage_tracker: DataLineageTrackerProtocol,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialize the lineage service.
+
+        Args:
+            lineage_tracker: Lineage DAG adapter implementation.
+            event_publisher: Kafka publisher for lineage events.
+        """
+        self._tracker = lineage_tracker
+        self._publisher = event_publisher
+
+    async def record_stage(
+        self,
+        step_name: str,
+        input_uris: list[str],
+        output_uri: str,
+        field_mappings: dict[str, list[str]],
+        metadata: dict[str, Any],
+        job_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+    ) -> str:
+        """Record a pipeline transformation step in the lineage graph.
+
+        Args:
+            step_name: Descriptive name of the transformation stage.
+            input_uris: Input dataset URIs consumed by the stage.
+            output_uri: Output dataset URI produced by the stage.
+            field_mappings: Output-to-input field mappings.
+            metadata: Additional context (row_count, schema, etc.)
+            job_id: Pipeline job ID.
+            tenant_id: Tenant context.
+
+        Returns:
+            Lineage edge ID string.
+        """
+        edge_id = await self._tracker.record_transformation(
+            step_name=step_name,
+            input_uris=input_uris,
+            output_uri=output_uri,
+            field_mappings=field_mappings,
+            metadata=metadata,
+            job_id=job_id,
+            tenant_id=tenant_id,
+        )
+        logger.info(
+            "Lineage stage recorded",
+            edge_id=edge_id,
+            step_name=step_name,
+            job_id=str(job_id),
+        )
+        return edge_id
+
+    async def trace_field(
+        self,
+        output_uri: str,
+        field_name: str,
+        tenant_id: uuid.UUID,
+    ) -> list[dict[str, Any]]:
+        """Trace a field back to its origin datasets.
+
+        Args:
+            output_uri: URI of the dataset containing the field.
+            field_name: Field name to trace.
+            tenant_id: Tenant context.
+
+        Returns:
+            List of lineage hop dicts from field to its origins.
+        """
+        return await self._tracker.trace_field_origin(
+            output_uri=output_uri,
+            field_name=field_name,
+            tenant_id=tenant_id,
+        )
+
+    async def get_impact(
+        self,
+        source_uri: str,
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Identify all downstream datasets affected by a source change.
+
+        Args:
+            source_uri: URI of the dataset that is changing.
+            tenant_id: Tenant context.
+
+        Returns:
+            Impact analysis dict (affected_datasets, affected_fields, impact_depth).
+        """
+        return await self._tracker.analyze_impact(source_uri=source_uri, tenant_id=tenant_id)
+
+    async def export_graph(self, tenant_id: uuid.UUID) -> dict[str, Any]:
+        """Export the full lineage graph for visualization.
+
+        Args:
+            tenant_id: Tenant context.
+
+        Returns:
+            Graph dict with nodes and edges.
+        """
+        return await self._tracker.export_lineage_graph(tenant_id=tenant_id)
+
+
+class SchedulingService:
+    """Manages pipeline scheduling across Airflow and Temporal orchestrators.
+
+    Wraps SchedulingAdapterProtocol to provide DAG generation, cron validation,
+    and run status tracking for all tenant pipelines.
+    """
+
+    def __init__(self, scheduling_adapter: SchedulingAdapterProtocol) -> None:
+        """Initialize the scheduling service.
+
+        Args:
+            scheduling_adapter: Orchestrator adapter implementation.
+        """
+        self._adapter = scheduling_adapter
+
+    async def create_airflow_dag(
+        self,
+        pipeline_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> str:
+        """Generate and return an Airflow DAG Python file.
+
+        Args:
+            pipeline_config: Pipeline definition dict.
+            tenant_id: Tenant context.
+
+        Returns:
+            Python source code string for the Airflow DAG.
+        """
+        dag_code = await self._adapter.generate_airflow_dag(
+            pipeline_config=pipeline_config,
+            tenant_id=tenant_id,
+        )
+        logger.info(
+            "Airflow DAG created",
+            pipeline_id=pipeline_config.get("pipeline_id"),
+            tenant_id=str(tenant_id),
+        )
+        return dag_code
+
+    async def create_temporal_workflow(
+        self,
+        pipeline_config: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Generate a Temporal workflow definition for a pipeline.
+
+        Args:
+            pipeline_config: Pipeline definition dict.
+            tenant_id: Tenant context.
+
+        Returns:
+            Temporal workflow spec dict.
+        """
+        spec = await self._adapter.generate_temporal_workflow(
+            pipeline_config=pipeline_config,
+            tenant_id=tenant_id,
+        )
+        logger.info(
+            "Temporal workflow created",
+            pipeline_id=pipeline_config.get("pipeline_id"),
+            tenant_id=str(tenant_id),
+        )
+        return spec
+
+    async def validate_schedule(self, cron_expression: str) -> dict[str, Any]:
+        """Validate a cron expression and return the next run times.
+
+        Args:
+            cron_expression: Standard cron string or special alias.
+
+        Returns:
+            Validation result dict (valid, expression, next_runs, description, error).
+        """
+        return await self._adapter.validate_cron(cron_expression)
+
+    async def update_run_status(
+        self,
+        pipeline_id: str,
+        run_id: str,
+        status: str,
+        metadata: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Update the status of a pipeline run.
+
+        Args:
+            pipeline_id: Logical pipeline identifier.
+            run_id: Unique run identifier.
+            status: New run status string.
+            metadata: Additional run context.
+            tenant_id: Tenant context.
+
+        Returns:
+            Updated run record dict.
+        """
+        return await self._adapter.track_run(
+            pipeline_id=pipeline_id,
+            run_id=run_id,
+            status=status,
+            metadata=metadata,
+            tenant_id=tenant_id,
+        )
