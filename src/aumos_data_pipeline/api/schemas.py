@@ -249,3 +249,162 @@ class JobStatusResponse(BaseModel):
 
     job: PipelineJobResponse
     quality_checks: list[QualityCheckResponse] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard (GAP-114)
+# ---------------------------------------------------------------------------
+
+
+class JobSummary(BaseModel):
+    """Aggregated summary of pipeline job counts by status."""
+
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    running: int = 0
+    pending: int = 0
+
+
+class PipelineDashboardResponse(BaseModel):
+    """Response for GET /pipeline/dashboard."""
+
+    tenant_id: uuid.UUID
+    job_summary: JobSummary
+    avg_quality_score: float | None = None
+    total_rows_processed: int = 0
+    recent_jobs: list[PipelineJobResponse] = Field(default_factory=list)
+    top_failing_sources: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Lineage (GAP-116)
+# ---------------------------------------------------------------------------
+
+
+class LineageEdgeResponse(BaseModel):
+    """A transformation edge in the lineage graph."""
+
+    edge_id: str
+    step_name: str
+    input_uris: list[str]
+    output_uri: str
+    field_mappings: dict[str, list[str]] = Field(default_factory=dict)
+    job_id: str
+    timestamp: str
+
+
+class JobLineageResponse(BaseModel):
+    """Response for GET /pipeline/jobs/{id}/lineage."""
+
+    job_id: uuid.UUID
+    dataset: dict[str, Any] = Field(default_factory=dict)
+    upstream: list[LineageEdgeResponse] = Field(default_factory=list)
+    downstream: list[LineageEdgeResponse] = Field(default_factory=list)
+    visualization_data: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Scheduling / Cron (GAP-118)
+# ---------------------------------------------------------------------------
+
+
+class ScheduleCreateRequest(BaseModel):
+    """Request to create a pipeline schedule."""
+
+    pipeline_id: str = Field(..., min_length=1, max_length=128)
+    display_name: str = Field(..., min_length=1, max_length=256)
+    cron_expression: str = Field(..., description="5-field cron expression or @daily/@hourly alias")
+    stages: list[str] = Field(default_factory=list)
+    orchestrator: str = Field(default="airflow", pattern="^(airflow|temporal|cron)$")
+    retry_policy: dict[str, Any] = Field(default_factory=dict)
+    tags: list[str] = Field(default_factory=list)
+
+
+class ScheduleResponse(BaseModel):
+    """Response after creating or retrieving a schedule."""
+
+    pipeline_id: str
+    display_name: str
+    cron_expression: str
+    next_runs: list[str] = Field(default_factory=list)
+    cron_description: str = ""
+    orchestrator: str
+    dag_or_workflow: dict[str, Any] | str | None = None
+
+
+class CronValidateRequest(BaseModel):
+    """Request to validate a cron expression."""
+
+    expression: str = Field(..., description="5-field cron or @alias")
+
+
+class CronValidateResponse(BaseModel):
+    """Response for cron expression validation."""
+
+    valid: bool
+    expression: str
+    next_runs: list[str] = Field(default_factory=list)
+    description: str = ""
+    error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Plugins (GAP-119)
+# ---------------------------------------------------------------------------
+
+
+class PluginRegisterRequest(BaseModel):
+    """Request to register a pipeline extension plugin."""
+
+    name: str = Field(..., min_length=1, max_length=128)
+    plugin_type: str = Field(..., pattern="^(connector|transformer|quality_check|exporter)$")
+    version: str = Field(..., pattern=r"^\d+\.\d+\.\d+$")
+    module_path: str = Field(..., description="Dotted Python import path")
+    class_name: str = Field(..., description="Class name to instantiate")
+    config_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class PluginResponse(BaseModel):
+    """Response after registering or retrieving a plugin."""
+
+    plugin_id: uuid.UUID
+    name: str
+    plugin_type: str
+    version: str
+    module_path: str
+    class_name: str
+    registered_by: uuid.UUID
+
+
+class PluginListResponse(BaseModel):
+    """Response listing all plugins for a tenant."""
+
+    plugins: list[PluginResponse]
+    total: int
+
+
+# ---------------------------------------------------------------------------
+# Streaming (GAP-117)
+# ---------------------------------------------------------------------------
+
+
+class KafkaBatchIngestRequest(BaseModel):
+    """Request to consume one Kafka micro-batch."""
+
+    topic: str = Field(..., min_length=1)
+    group_id: str = Field(..., min_length=1)
+    credentials_secret_id: str = Field(..., min_length=1)
+    batch_size: int = Field(default=1000, gt=0, le=100000)
+    timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    auto_offset_reset: str = Field(default="latest", pattern="^(earliest|latest)$")
+
+
+class KafkaBatchIngestResponse(BaseModel):
+    """Response after consuming a Kafka micro-batch."""
+
+    job_id: uuid.UUID
+    output_uri: str
+    message_count: int
+    topic: str
+    schema: dict[str, str] = Field(default_factory=dict)
